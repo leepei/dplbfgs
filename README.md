@@ -14,3 +14,11 @@ Additionally the code depends on the BLAS and LAPACK libraries.
 
 The code split.py, borrowed from [MPI-LIBLINEAR](https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/distributed-liblinear/), partition the data and distribted the segments to the designated machines.
 Then the program ./train solves the optimization problem to obtain a model.
+
+## Problem being solved
+In the paper the problem formulation is
+$$\min_{w} \lambda \|w\|_1 + \frac{1}{n} \sum_{i=1}^n \log(1 + \exp(- y_i w^T x_i)),$$
+with $\lambda > 0$ as the tunable parameter, but in our implementation we use
+$$\min_{w} \|w\|_1 + C \sum_{i=1}^n \log(1 + \exp(- y_i w^T x_i))$$
+with the parameter being $C>0$ instead.
+Note that the two are equivalent (with a scaling of the objective) by setting $C = 1 / (\lambda n)$.
