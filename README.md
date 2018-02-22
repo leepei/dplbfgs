@@ -17,8 +17,12 @@ Then the program ./train solves the optimization problem to obtain a model.
 
 ## Problem being solved
 In the paper the problem formulation is
-$$\min_{w} \lambda \|w\|_1 + \frac{1}{n} \sum_{i=1}^n \log(1 + \exp(- y_i w^T x_i)),$$
-with $\lambda > 0$ as the tunable parameter, but in our implementation we use
-$$\min_{w} \|w\|_1 + C \sum_{i=1}^n \log(1 + \exp(- y_i w^T x_i))$$
-with the parameter being $C>0$ instead.
-Note that the two are equivalent (with a scaling of the objective) by setting $C = 1 / (\lambda n)$.
+
+min_{w} lambda |w|_1 + (\sum_{i=1}^n \log(1 + \exp(- y_i w^T x_i))) / n
+
+with \lambda > 0 as the tunable parameter, but in our implementation we use
+
+min_{w} |w|_1 + C \sum_{i=1}^n \log(1 + \exp(- y_i w^T x_i))
+
+with the parameter being C>0 instead.
+Note that the two are equivalent (with a scaling of the objective) by setting C = 1 / (\lambda n).
