@@ -1,7 +1,9 @@
 # DPLBFGS - A Distributed Proximal LBFGS Method for Regularized Optimization
 
 This code implements the algorithm used in the experiment of the following paper in C/C++ and MPI:
-	_Lee, Ching-pei, Lim, Cong Han, Wright, Stephen J.. [Improving Communication Complexity of Distributed Non-smooth Regularized Minimization Using Previous Updates].
+_Lee, Ching-pei, Lim, Cong Han, Wright, Stephen J. [A Distributed Quasi-Newton Algorithm for Empirical Risk
+	Minimization with Nonsmooth Regularization](http://www.optimization-online.org/DB_HTML/2018/03/6500.html). The 24th ACM SIGKDD
+	International Conference on Knowledge Discovery and Data Mining, 2018._
 
 In additional to our algorithm, the following algorithms are also implemented.
 - OWLQN
@@ -16,13 +18,9 @@ The code split.py, borrowed from [MPI-LIBLINEAR](https://www.csie.ntu.edu.tw/~cj
 Then the program ./train solves the optimization problem to obtain a model.
 
 ## Problem being solved
-In the paper the problem formulation is
 
-min_{w} lambda |w|_1 + (\sum_{i=1}^n \log(1 + \exp(- y_i w^T x_i))) / n
-
-with \lambda > 0 as the tunable parameter, but in our implementation we use
+The code solves the L1-regularized logistic regression problem.
 
 min_{w} |w|_1 + C \sum_{i=1}^n \log(1 + \exp(- y_i w^T x_i))
 
-with the parameter being C>0 instead.
-Note that the two are equivalent (with a scaling of the objective) by setting C = 1 / (\lambda n).
+with a user-specified parameter C > 0.
