@@ -1134,7 +1134,7 @@ void PLBFGS::plbfgs(double *w)
 	double *loss_g = new double[n];
 	double *local_step = new double[length];
 	double *R = new double[4 * M * M];
-	double *step;
+	double *step = new double[n];
 	int *fullindex;
 	double **inner_product_matrix = new double*[M];
 	for (i=0; i < M; i++)
@@ -1247,7 +1247,6 @@ void PLBFGS::plbfgs(double *w)
 		step_size = init_step_size;
 		if (indexlength < n * sparse_factor) // conduct sparse communication
 		{
-			step = new double[indexlength];
 			fullindex = new int[indexlength];
 			//First decide the size to communicate from each machine
 			//Then another round to communicate the sparse vector
@@ -1270,7 +1269,6 @@ void PLBFGS::plbfgs(double *w)
 			communication += 2.0 * indexlength / n;
 			f = fun_obj->armijo_line_search(step, w, loss_g, &step_size, eta, &num_linesearch, &delta, fullindex, indexlength, tmpdisplace[rank], tmprecvcount[rank]);
 			delete[] fullindex;
-			delete[] step;
 			for (i=0;i<newindexlength;i++)
 			{
 				w[index[i]] += local_step[i] * step_size;
@@ -1279,7 +1277,6 @@ void PLBFGS::plbfgs(double *w)
 		}
 		else
 		{
-			step = new double[n];
 
 			if (newindexlength < length)
 				for (i=newindexlength-1;i >= 0; i--)
@@ -1291,7 +1288,6 @@ void PLBFGS::plbfgs(double *w)
 			MPI_Allgatherv(local_step, length, MPI_DOUBLE, step, recv_count, displace, MPI_DOUBLE, MPI_COMM_WORLD);
 			communication += 1.0;
 			f = fun_obj->armijo_line_search(step, w, loss_g, &step_size, eta, &num_linesearch, &delta);
-			delete[] step;
 			for (i=0;i<length;i++)
 			{
 				w[start + i] += local_step[i] * step_size;
@@ -1320,6 +1316,7 @@ void PLBFGS::plbfgs(double *w)
 		delete[] inner_product_matrix[i];
 	delete[] inner_product_matrix;
 	delete[] R;
+	delete[] step;
 }
 
 void PLBFGS::update_inner_products(double **inner_product_matrix, int k, int DynamicM, double *s, double *y)
