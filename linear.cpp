@@ -1591,6 +1591,16 @@ void PLBFGS::SpaRSA(double *w, double *loss_g, double *R, double *s, double *y, 
 
 	if (iter == 1)
 		inner_eps /= 4.0;
+	delete[] oldd;
+	delete[] oldg;
+	delete[] g;
+	delete[] subg;
+	delete[] subw;
+	delete[] ddiff;
+	delete[] SYTd;
+	delete[] tmp;
+	delete[] subs;
+	delete[] suby;
 }
 
 void PLBFGS::prox_grad(double *w, double *g, double *local_step, double *oldd, double alpha, int indexlength)
