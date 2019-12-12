@@ -23,11 +23,20 @@ void exit_with_help()
 	"	 0 -- L1-regularized logistic regression (OWLQN)\n"
 	"	 1 -- L1-regularized logistic regression (Proximal-LBFGS)\n"
 	"	 2 -- L1-regularized logistic regression (SPARSA)\n"
+	"	 3 -- L2-regularized support vector classification (dual, Proximal-LBFGS)\n"
+	"	 4 -- L2-regularized support vector classification (dual, BDA)\n"
+	"	 5 -- L2-regularized support vector classification (dual, ADN)\n"
+	"	 6 -- L2-regularized support vector classification (dual, accelerated BDA)\n"
 	"-c cost : set the parameter C (default 1)\n"
-	"-I iter : max inner iterations per round for -s 1\n"
-	"-a epsilon : adaptive stopping condition of the inner solver for -s 1\n"
+	"-I iter : max inner iterations per round for -s 1, 3, 4, 5, 6, 7\n"
+	"-m m: number of historical iterations to be used in -s 1, 3\n"
+	"-S iter : when to switch to the LBFGS approach from the initializer in -s 1, 3\n"
+	"-a epsilon : adaptive stopping condition of the inner solver for -s 1, 3\n"
 	"-e epsilon : set tolerance of termination criterion\n"
 	"-B bias : if bias >= 0, instance x becomes [x; bias]; if < 0, no bias term added (default -1)\n"
+	"-k kappa : kappa for acceleration: the subproblem becomes mu + kappa-strongly convex by adding a corresponding quadratic term\n"
+	"-b beta : extrapolation parameter for finding the center in accelerated methods\n"
+	"-E eta : warmstart parameter\n"
 	"-q : quiet mode (no outputs)\n"
 	);
 	mpi_exit(1);
@@ -126,9 +135,12 @@ void parse_command_line(int argc, char **argv, char *input_file_name, char *mode
 	param.C = 1.0;
 	param.eps = 0.01; // see setting below
 	param.m = 10;
-	param.eta = 1e-4;
-	param.max_inner_iter = 100;
+	param.eta = 0;
+	param.beta = -1;
+	param.kappa = -1;
+	param.max_inner_iter = 0;
 	param.inner_eps = 0.01;
+	param.minswitch = -1;
 	
 	bias = -1;
 
@@ -142,6 +154,16 @@ void parse_command_line(int argc, char **argv, char *input_file_name, char *mode
 		{
 			case 's':
 				param.solver_type = atoi(argv[i]);
+				break;
+			case 'b':
+				param.beta = atof(argv[i]);
+				break;
+			case 'E':
+				param.eta = atof(argv[i]);
+				break;
+
+			case 'k':
+				param.kappa = atof(argv[i]);
 				break;
 
 			case 'I':
@@ -172,6 +194,9 @@ void parse_command_line(int argc, char **argv, char *input_file_name, char *mode
 				print_func = &print_null;
 				i--;
 				break;
+			case 'S':
+				param.minswitch = atoi(argv[i]);
+				break;
 
 
 			default:
@@ -180,6 +205,13 @@ void parse_command_line(int argc, char **argv, char *input_file_name, char *mode
 				exit_with_help();
 				break;
 		}
+	}
+	if (param.max_inner_iter == 0)
+	{
+		if (param.solver_type == L1R_LR_BFGS || param.solver_type == L2R_L2_BFGS)
+			param.max_inner_iter = 100;
+		else
+			param.max_inner_iter = 1;
 	}
 
 	set_print_string_function(print_func);
@@ -210,6 +242,8 @@ void parse_command_line(int argc, char **argv, char *input_file_name, char *mode
 			++p;
 		sprintf(model_file_name,"%s.model",p);
 	}
+	if (param.minswitch == -1)
+		param.minswitch = param.m;
 
 	// default solver for parameter selection is L2R_L2LOSS_SVC
 }

@@ -36,7 +36,18 @@ int64_t wall_clock_ns()
 #endif
 double communication;
 double global_n;
+double *QD;
+int *alphaindex;
 
+static inline double l1_loss (double xi)
+{
+	return xi;
+}
+
+static inline double l2_loss (double xi)
+{
+	return xi*xi;
+}
 typedef signed char schar;
 template <class T> static inline void swap(T& x, T& y) { T t=x; x=y; y=t; }
 template <class T> static inline void swap(T* a, int x, int y) { T t=a[x]; a[x]=a[y]; a[y]=t; }
@@ -141,7 +152,1164 @@ void inverse(double* A, int N)
 	delete[] WORK;
 }
 
+#define GETI(i) (y[i]+1)
+static void solve_l2r_l1l2_svc(const problem *prob, double *w, double eps,
+		double Cp, double Cn, int solver_type, int max_inner_iter = 1, double *alpha_out = NULL)
+{
+	static int count = 0;
+	double accumulated_time = 0;
+	int l = prob->l;
+	int w_size = prob->n;
+	int i, s, iter = 0;
+	double C, d, G;
+	int max_iter = 100000;
+	if (alpha_out != NULL)
+		max_iter = 1;
+	double *alpha = new double[l];
+	double *alpha_orig = new double[l];
+	double *alpha_inc = new double[l];
+	double *w_orig = new double[w_size];
+	double *current_w = new double[w_size];
+	double *allreduce_buffer = new double[w_size + 2];
+	double old_primal, primal, obj, grad_alpha_inc;
+	double lambda = 0;
+	double loss, reg = 0;
+	schar *y = new schar[l];
+	double eta;
+	double init_primal = 0;
+	static double (*loss_term) (const double) = &l2_loss;
+	double alpha_inc_denominator;
+	double alpha_inc_numerator;
+	double w_inc_square;
+	double w_dot_w_inc;
+	double max_step;
+	int nr_node = mpi_get_size();
+	int rank = mpi_get_rank();
+	int shift = int(ceil(double(w_size) / double(nr_node)));
+	int start = shift * rank;
+	int length = min(max(w_size - start, 0), shift);
+	double innerproduct_buffer[2];
+	if (length == 0)
+		start = 0;
+	count++;
 
+	// PG: projected gradient
+	double PG;
+
+	// default solver_type: L2R_L2LOSS_SVC_DUAL
+	double diag[3] = {0.5/Cn, 0, 0.5/Cp};
+	double upper_bound[3] = {INF, 0, INF};
+	double Cs[3] = {Cn, 0, Cp};
+	if(solver_type != L2R_L2_BDA)
+	{
+		loss_term = &l1_loss;
+		lambda = 1e-3;
+		diag[0] = 0;
+		diag[2] = 0;
+		upper_bound[0] = Cn;
+		upper_bound[2] = Cp;
+	}
+
+	for(i=0; i<l; i++)
+	{
+		if(prob->y[i] > 0)
+		{
+			y[i] = +1;
+			init_primal += Cp;
+		}
+		else
+		{
+			y[i] = -1;
+			init_primal += Cn;
+		}
+	}
+	mpi_allreduce(&init_primal, 1, MPI_DOUBLE, MPI_SUM);
+	if (alpha_out == NULL)
+	{
+		for(i=0; i<l; i++)
+			alpha[i] = 0;
+
+		for(i=0; i<w_size; i++)
+			w[i] = 0;
+	}
+	else
+		memcpy(alpha, alpha_out, sizeof(double) * l);
+
+	int64_t timer_st = wall_clock_ns(), timer_ed;
+
+	if (count == 1)
+	{
+		QD = new double[l];
+		alphaindex = new int[l];
+		for(i=0; i<l; i++)
+		{
+			QD[i] = diag[GETI(i)] + lambda;
+
+			feature_node * const xi = prob->x[i];
+			QD[i] += sparse_operator::nrm2_sq(xi);
+
+			alphaindex[i] = i;
+		}
+	}
+
+	if (alpha_out == NULL)
+	{
+		old_primal = 0;
+		obj = 0;
+		for (i=start;i<start+length;i++)
+			reg += w[i] * w[i];
+		mpi_allreduce(&reg, 1, MPI_DOUBLE, MPI_SUM);
+		reg *= 0.5;
+		for (i=0;i<l;i++)
+		{
+			obj += alpha[i] * (alpha[i] * diag[GETI(i)] - 2);
+			feature_node const *xi = prob->x[i];
+			loss = 1 - y[i] * sparse_operator::dot(w, xi);
+
+			if (loss > 0)
+				old_primal += loss_term(loss) * Cs[GETI(i)];
+		}
+		mpi_allreduce(&old_primal, 1, MPI_DOUBLE, MPI_SUM);
+		mpi_allreduce(&obj, 1, MPI_DOUBLE, MPI_SUM);
+		old_primal += reg;
+		obj = obj / 2 + reg;
+		memcpy(current_w, w, sizeof(double) * w_size);
+	}
+	while (iter < max_iter)
+	{
+		memcpy(w_orig, w, sizeof(double) * w_size);
+		memcpy(alpha_orig, alpha, sizeof(double) * l);
+		memset(alpha_inc, 0, sizeof(double) * l);
+		max_step = INF;
+		w_inc_square = 0;
+		w_dot_w_inc = 0;
+		alpha_inc_numerator = 0;
+		alpha_inc_denominator = 0;
+
+		for (int inner_iter = 0;inner_iter < max_inner_iter; inner_iter++)
+		{
+			for (i=0; i<l; i++)
+			{
+				int j = i+rand()%(l-i);
+				swap(alphaindex[i], alphaindex[j]);
+			}
+
+			for (s=0; s<l; s++)
+			{
+				i = alphaindex[s];
+				const schar yi = y[i];
+				feature_node const *xi = prob->x[i];
+
+				G = yi*sparse_operator::dot(w, xi)-1;
+
+				C = upper_bound[GETI(i)];
+				G += alpha[i]*diag[GETI(i)];
+
+				PG = 0;
+				if (alpha[i] == 0)
+				{
+					if (G < 0)
+						PG = G;
+				}
+				else if (alpha[i] == C)
+				{
+					if (G > 0)
+						PG = G;
+				}
+				else
+					PG = G;
+
+				if(fabs(PG) > 1.0e-12)
+				{
+					double alpha_old = alpha[i];
+					alpha[i] = min(max(alpha[i] - G/QD[i], 0.0), C);
+					d = yi*(alpha[i] - alpha_old);
+					sparse_operator::axpy(d, xi, w);
+				}
+			}
+		}
+
+		for (i=0;i<l;i++)
+		{
+			alpha_inc[i] = alpha[i] - alpha_orig[i];
+			alpha_inc_numerator += alpha_inc[i] * (-1 + diag[GETI(i)] * alpha_orig[i]);
+			alpha_inc_denominator += diag[GETI(i)] * alpha_inc[i] * alpha_inc[i];
+			if (alpha_inc[i] > 0)
+				max_step = min(max_step, (upper_bound[GETI(i)] - alpha_orig[i]) / alpha_inc[i]);
+			else if (alpha_inc[i] < 0)
+				max_step = min(max_step, -alpha_orig[i] / alpha_inc[i]);
+		}
+
+		for (i=0;i<w_size;i++)
+			allreduce_buffer[i] = w[i] - w_orig[i];
+
+		allreduce_buffer[w_size] = alpha_inc_denominator;
+		allreduce_buffer[w_size + 1] = alpha_inc_numerator;
+		mpi_allreduce(allreduce_buffer, w_size + 2, MPI_DOUBLE, MPI_SUM);
+		communication += 1 + 2.0 / (double) w_size;
+		mpi_allreduce(&max_step, 1, MPI_DOUBLE, MPI_MIN);
+		communication += 1.0 / (double) w_size;
+		
+
+		for (i=start;i<start + length;i++)
+		{
+			w_inc_square += allreduce_buffer[i] * allreduce_buffer[i];
+			w_dot_w_inc += allreduce_buffer[i] * w_orig[i];
+		}
+		innerproduct_buffer[0] = w_inc_square;
+		innerproduct_buffer[1] = w_dot_w_inc;
+		mpi_allreduce(innerproduct_buffer, 2, MPI_DOUBLE, MPI_SUM);
+		communication += 2.0 / (double) w_size;
+
+		alpha_inc_denominator = allreduce_buffer[w_size];
+		alpha_inc_numerator = allreduce_buffer[w_size + 1];
+		w_inc_square = innerproduct_buffer[0];
+		w_dot_w_inc = innerproduct_buffer[1];
+
+		grad_alpha_inc = w_dot_w_inc + alpha_inc_numerator;
+		double aQa = w_inc_square + alpha_inc_denominator;
+		eta = min(max_step, -grad_alpha_inc / aQa);
+		if (eta <= 0)
+		{
+			memcpy(w, current_w, sizeof(double) * w_size);
+			memcpy(alpha, alpha_orig, sizeof(double) * l);
+			info("WARNING: Negative step faced\n");
+			break;
+		}
+
+
+		for (i=0;i<w_size;i++)
+			w[i] = w_orig[i] + eta * allreduce_buffer[i];
+		for (i=0;i<l;i++)
+			alpha[i] = alpha_orig[i] + eta * alpha_inc[i];
+		timer_ed = wall_clock_ns();
+		accumulated_time += wall_time_diff(timer_ed, timer_st);
+		iter++;
+
+		if (alpha_out == NULL)
+		{
+			obj += eta * (0.5 * eta * aQa + grad_alpha_inc);
+
+			reg += eta * (w_dot_w_inc + 0.5 * eta * w_inc_square);
+			primal = 0;
+
+			for (i=0;i<l;i++)
+			{
+				feature_node const *xi = prob->x[i];
+				loss = 1 - y[i] * sparse_operator::dot(w, xi);
+
+				if (loss > 0)
+					primal += Cs[GETI(i)] * loss_term(loss);
+			}
+			mpi_allreduce(&primal, 1, MPI_DOUBLE, MPI_SUM);
+
+			primal += reg;
+
+			if (primal < old_primal)
+			{
+				old_primal = primal;
+				memcpy(current_w, w, sizeof(double) * w_size);
+			}
+
+			double gap = (old_primal+obj) / init_primal;
+			info("iter %06d primal %15.20e dual %15.20e step %5.3e duality gap %5.3e time %5.3e communication %5.3e\n", iter, primal, obj, eta, gap, accumulated_time, communication);
+			timer_st = wall_clock_ns();
+			if (gap < eps)
+			{
+				memcpy(w, current_w, sizeof(double) * w_size);
+				break;
+			}
+		}
+	}
+
+	if (alpha_out == NULL)
+	{
+		info("\noptimization finished, #iter = %d\n",iter);
+		if (iter >= max_iter)
+			info("\nWARNING: reaching max number of iterations\n\n");
+
+		// calculate objective value
+
+		int nSV = 0;
+		for(i=0; i<l; i++)
+			if(alpha[i] > 0)
+				++nSV;
+		mpi_allreduce(&nSV, 1, MPI_INT, MPI_SUM);
+		info("nSV = %d\n",nSV);
+	}
+	else
+		memcpy(alpha_out, alpha, sizeof(double) * l);
+
+//	delete [] QD;
+//	delete [] index;
+	delete [] alpha;
+	delete [] alpha_inc;
+	delete [] alpha_orig;
+	delete [] w_orig;
+	delete [] current_w;
+	delete [] allreduce_buffer;
+	delete [] y;
+}
+
+/* Accelerated BDA: acceleration through Catalyst
+ *
+ * Work flow: For the t-th outer iteration, the objective is modified to D(alpha) + kappa / 2 |alpha - y_{t-1}|^2, for some y_{t-1}
+ * Optimize the problem from an initial point A_0^t with a fixed number of iterations to get an approximate solution A_t,
+ * then extrapolate to get the next y by y_t = A_t + beta_t * (A_t - A_{t-1}) ( y_0 = A_0^0)
+ *
+ *
+ * Decision to make: A_0^t, kappa, and beta_t
+ * kappa is an input, beta_t is computed by:
+ * q = mu / (mu + kappa)
+ * a_0 = sqrt(q) if mu > 0, else a_0 = 1
+ * a_t is the solution of a_t^2 = (1 - a_t) a_{t-1}^2 + q * a_t
+ * Then beta_t = a_{t-1} ( 1 - a_{t-1}) / (a_{t-1}^2 + a_t)
+ *
+ * If mu > 0: a_t = sqrt(q), and beta_t = (1 - a_t) / (1 + a_t) for all t
+ *
+ * If mu = 0: a_t = (-a_{t-1}^2 + sqrt(a_{t-1}^4 + 4 * a_{t-1}^2)) / 2 = -a_{t-1}^2 (1 + sqrt(a_{t-1}^2 + 4)) / 2
+ * beta_t = 2 (1 - a_{t-1}) / (a_{t-1} (sqrt(a_{t-1}^2 + 4) - 1)
+ *
+ * Modified obj: D(alpha) + kappa/2 * alpha^T alpha - kappa * y_{t-1}^T alpha
+ * 
+ */
+static void solve_l2r_l1l2_svc_catalyst(const problem *prob, double *w, double
+		eps, double Cp, double Cn, int solver_type, double input_eta = -1, double input_kappa = -1, double input_beta = -1, int T = 1)
+{
+	double accumulated_time = 0;
+	double mu = min(0.5 / Cp, 0.5 / Cn);
+	double L = 0;
+	int l = prob->l;
+	int w_size = prob->n;
+	int i, s, iter = 0;
+	double C, d, G;
+	int max_iter = 100000;
+	int max_inner_iter = 1;
+	double *alpha = new double[l];
+	double *alpha_orig = new double[l];
+	double *alpha_inc = new double[l];
+	double *old_alpha = new double[l];
+	int catalyst_iter = 0;
+	double *w_orig = new double[w_size];
+	double *current_w = new double[w_size];
+	double *allreduce_buffer = new double[w_size + 2];
+	double old_primal, primal, obj, grad_alpha_inc;
+	double lambda = 0;
+	double loss, reg = 0;
+	schar *y = new schar[l];
+	double eta = 0;
+	double init_primal = 0;
+	static double (*loss_term) (const double) = &l2_loss;
+	double alpha_inc_denominator;
+	double alpha_inc_numerator;
+	double w_inc_square;
+	double w_dot_w_inc;
+	double max_step;
+	int nr_node = mpi_get_size();
+	int rank = mpi_get_rank();
+	int shift = int(ceil(double(w_size) / double(nr_node)));
+	int start = shift * rank;
+	int length = min(max(w_size - start, 0), shift);
+	double innerproduct_buffer[2];
+	if (length == 0)
+		start = 0;
+
+	// PG: projected gradient
+	double PG;
+
+	// default solver_type: L2R_L2LOSS_SVC_DUAL
+	double diag[3] = {0.5/Cn, 0, 0.5/Cp};
+	double upper_bound[3] = {INF, 0, INF};
+	double Cs[3] = {Cn, 0, Cp};
+	if(solver_type != L2R_L2_BDA_CATALYST)
+	{
+		loss_term = &l1_loss;
+		lambda = 1e-3;
+		diag[0] = 0;
+		diag[2] = 0;
+		upper_bound[0] = Cn;
+		upper_bound[2] = Cp;
+	}
+
+	for(i=0; i<l; i++)
+	{
+		if(prob->y[i] > 0)
+		{
+			y[i] = +1;
+			init_primal += Cp;
+		}
+		else
+		{
+			y[i] = -1;
+			init_primal += Cn;
+		}
+	}
+	mpi_allreduce(&init_primal, 1, MPI_DOUBLE, MPI_SUM);
+	for(i=0; i<l; i++)
+		alpha[i] = 0;
+
+	for(i=0; i<w_size; i++)
+		w[i] = 0;
+
+	int64_t timer_st = wall_clock_ns(), timer_ed;
+
+	QD = new double[l];
+	alphaindex = new int[l];
+	for(i=0; i<l; i++)
+	{
+		QD[i] = diag[GETI(i)] + lambda;
+
+		feature_node * const xi = prob->x[i];
+		QD[i] += sparse_operator::nrm2_sq(xi);
+
+		alphaindex[i] = i;
+		L = max(QD[i], L);
+	}
+	mpi_allreduce(&L, 1, MPI_DOUBLE, MPI_SUM);
+	L += mu;
+	double kappa = max(L - 2 * mu, 0.0);
+	if (input_kappa >= 0)
+		kappa = input_kappa;
+	double q = mu / (mu + kappa);
+	double beta = (1 - sqrt(q)) / (1 + sqrt(q));
+	if (input_beta >= 0)
+		beta = input_beta;
+	double eta_warm = 1 / (L + kappa);
+	if (input_eta >= 0)
+		eta_warm = input_eta;
+	info("L = %g, mu = %g, kappa = %g, q = %g, beta = %g, eta_warm = %g\n",L, mu, kappa, q, beta, eta_warm);
+	double origdiag[3] = {0, 0, 0};
+	for (i=0;i<3;i++)
+		origdiag[i] = diag[i];
+	double *yt = new double[l];
+	memcpy(yt, alpha, sizeof(double) * l);
+
+	diag[0] += kappa;
+	diag[2] += kappa;
+	for (i=0;i<l;i++)
+		QD[i] += kappa;
+
+	old_primal = 0;
+	obj = 0;
+	for (i=start;i<start+length;i++)
+		reg += w[i] * w[i];
+	mpi_allreduce(&reg, 1, MPI_DOUBLE, MPI_SUM);
+	reg *= 0.5;
+	for (i=0;i<l;i++)
+	{
+		obj += alpha[i] * (alpha[i] * origdiag[GETI(i)] - 2);
+		feature_node const *xi = prob->x[i];
+		loss = 1 - y[i] * sparse_operator::dot(w, xi);
+
+		if (loss > 0)
+			old_primal += loss_term(loss) * Cs[GETI(i)];
+	}
+	mpi_allreduce(&old_primal, 1, MPI_DOUBLE, MPI_SUM);
+	mpi_allreduce(&obj, 1, MPI_DOUBLE, MPI_SUM);
+	old_primal += reg;
+	obj = obj / 2 + reg;
+	memcpy(current_w, w, sizeof(double) * w_size);
+	memcpy(old_alpha, alpha, sizeof(double) * l);
+	int overallcounter = 0;
+
+	while (iter < max_iter)
+	{
+		catalyst_iter = 0;
+		while (catalyst_iter < T)
+		{
+			memcpy(w_orig, w, sizeof(double) * w_size);
+			memcpy(alpha_orig, alpha, sizeof(double) * l);
+			memset(alpha_inc, 0, sizeof(double) * l);
+			max_step = INF;
+			w_inc_square = 0;
+			w_dot_w_inc = 0;
+			alpha_inc_numerator = 0;
+			alpha_inc_denominator = 0;
+
+			for (int inner_iter = 0;inner_iter < max_inner_iter; inner_iter++)
+			{
+				for (i=0; i<l; i++)
+				{
+					int j = i+rand()%(l-i);
+					swap(alphaindex[i], alphaindex[j]);
+				}
+
+				overallcounter++;
+				for (s=0; s<l; s++)
+				{
+					i = alphaindex[s];
+					const schar yi = y[i];
+					feature_node const *xi = prob->x[i];
+
+					G = yi*sparse_operator::dot(w, xi)-1 - yt[i] * kappa;
+
+					C = upper_bound[GETI(i)];
+					G += alpha[i]*diag[GETI(i)];
+
+					PG = 0;
+					if (alpha[i] == 0)
+					{
+						if (G < 0)
+							PG = G;
+					}
+					else if (alpha[i] == C)
+					{
+						if (G > 0)
+							PG = G;
+					}
+					else
+						PG = G;
+
+					if(fabs(PG) > 1.0e-12)
+					{
+						double alpha_old = alpha[i];
+						alpha[i] = min(max(alpha[i] - G/QD[i], 0.0), C);
+						d = yi*(alpha[i] - alpha_old);
+						sparse_operator::axpy(d, xi, w);
+					}
+				}
+			}
+
+			for (i=0;i<l;i++)
+			{
+				alpha_inc[i] = alpha[i] - alpha_orig[i];
+				alpha_inc_numerator += alpha_inc[i] * (-1 - kappa * yt[i] + diag[GETI(i)] * alpha_orig[i]);
+				alpha_inc_denominator += diag[GETI(i)] * alpha_inc[i] * alpha_inc[i];
+				if (alpha_inc[i] > 0)
+					max_step = min(max_step, (upper_bound[GETI(i)] - alpha_orig[i]) / alpha_inc[i]);
+				else if (alpha_inc[i] < 0)
+					max_step = min(max_step, -alpha_orig[i] / alpha_inc[i]);
+			}
+
+			for (i=0;i<w_size;i++)
+				allreduce_buffer[i] = w[i] - w_orig[i];
+
+			allreduce_buffer[w_size] = alpha_inc_denominator;
+			allreduce_buffer[w_size + 1] = alpha_inc_numerator;
+			mpi_allreduce(allreduce_buffer, w_size + 2, MPI_DOUBLE, MPI_SUM);
+			communication += 1 + 2.0 / (double) w_size;
+			mpi_allreduce(&max_step, 1, MPI_DOUBLE, MPI_MIN);
+			communication += 1.0 / (double) w_size;
+			
+
+			for (i=start;i<start + length;i++)
+			{
+				w_inc_square += allreduce_buffer[i] * allreduce_buffer[i];
+				w_dot_w_inc += allreduce_buffer[i] * w_orig[i];
+			}
+			innerproduct_buffer[0] = w_inc_square;
+			innerproduct_buffer[1] = w_dot_w_inc;
+			mpi_allreduce(innerproduct_buffer, 2, MPI_DOUBLE, MPI_SUM);
+			communication += 2.0 / (double) w_size;
+			w_inc_square = innerproduct_buffer[0];
+			w_dot_w_inc = innerproduct_buffer[1];
+
+			alpha_inc_denominator = allreduce_buffer[w_size];
+			alpha_inc_numerator = allreduce_buffer[w_size + 1];
+
+			grad_alpha_inc = w_dot_w_inc + alpha_inc_numerator;
+			double aQa = w_inc_square + alpha_inc_denominator;
+			eta = min(max_step, -grad_alpha_inc / aQa);
+			if (eta <= 0)
+			{
+				memcpy(w, w_orig, sizeof(double) * w_size);
+				memcpy(alpha, alpha_orig, sizeof(double) * l);
+				timer_ed = wall_clock_ns();
+				accumulated_time += wall_time_diff(timer_ed, timer_st);
+				break;
+			}
+
+
+			for (i=0;i<w_size;i++)
+				w[i] = w_orig[i] + eta * allreduce_buffer[i];
+			for (i=0;i<l;i++)
+				alpha[i] = alpha_orig[i] + eta * alpha_inc[i];
+			timer_ed = wall_clock_ns();
+			accumulated_time += wall_time_diff(timer_ed, timer_st);
+			catalyst_iter++;
+			reg += eta * (w_dot_w_inc + 0.5 * eta * w_inc_square);
+		}
+		obj = 0;
+		for (i=0;i<l;i++)
+			obj += alpha[i] * (-1 + origdiag[GETI(i)] * alpha[i] * 0.5);
+		mpi_allreduce(&obj, 1, MPI_DOUBLE, MPI_SUM);
+
+		obj += reg;
+
+		primal = 0;
+
+		for (i=0;i<l;i++)
+		{
+			feature_node const *xi = prob->x[i];
+			loss = 1 - y[i] * sparse_operator::dot(w, xi);
+
+			if (loss > 0)
+				primal += Cs[GETI(i)] * loss_term(loss);
+		}
+		mpi_allreduce(&primal, 1, MPI_DOUBLE, MPI_SUM);
+
+		primal += reg;
+
+		if (primal < old_primal)
+		{
+			old_primal = primal;
+			memcpy(current_w, w, sizeof(double) * w_size);
+		}
+
+		double gap = (old_primal+obj) / init_primal;
+		iter++;
+		info("iter %06d primal %15.20e dual %15.20e step %5.3e duality gap %5.3e time %5.3e communication %5.3e\n", overallcounter, primal, obj, eta, gap, accumulated_time, communication);
+		timer_st = wall_clock_ns();
+		if (gap < eps)
+		{
+			memcpy(w, current_w, sizeof(double) * w_size);
+			break;
+		}
+		if (beta > 0)
+			for (i=0;i<l;i++)
+				yt[i] = alpha[i] + beta * (alpha[i] - old_alpha[i]);
+		else
+			memcpy(yt, alpha, sizeof(double) * l);
+		memcpy(old_alpha, alpha, l * sizeof(double));
+		if (eta_warm > 0)
+		{
+			memcpy(w_orig, w, sizeof(double) * w_size);
+			memset(w, 0, sizeof(double) * w_size);
+			for (i=0;i<l;i++)
+			{
+				feature_node const *xi = prob->x[i];
+				const schar yi = y[i];
+				G = yi*sparse_operator::dot(w_orig, xi) - 1 + alpha[i] * origdiag[GETI(i)];
+				C = upper_bound[GETI(i)];
+
+				PG = 0;
+				if (alpha[i] == 0)
+				{
+					if (G < 0)
+						PG = G;
+				}
+				else if (alpha[i] == C)
+				{
+					if (G > 0)
+						PG = G;
+				}
+				else
+					PG = G;
+
+				if(fabs(PG) > 1.0e-12)
+					alpha[i] = min(max(alpha[i] - G * eta_warm, 0.0), C);
+				if (fabs(alpha[i]) > 1.0e-12)
+				{
+					d = yi*alpha[i];
+					sparse_operator::axpy(d, xi, w);
+				}
+			}
+			mpi_allreduce(w, w_size, MPI_DOUBLE, MPI_SUM);
+			reg = 0;
+			for (i=start;i<start + length;i++)
+				reg += w[i] * w[i];
+			mpi_allreduce(&reg, 1, MPI_DOUBLE, MPI_SUM);
+			communication += 1.0 + 1.0 / (double) w_size;
+			reg *= 0.5;
+		}
+	}
+
+	info("\noptimization finished, #iter = %d\n",iter);
+	if (iter >= max_iter)
+		info("\nWARNING: reaching max number of iterations\n\n");
+
+
+	int nSV = 0;
+	for(i=0; i<l; i++)
+		if(alpha[i] > 0)
+			++nSV;
+	mpi_allreduce(&nSV, 1, MPI_INT, MPI_SUM);
+	info("nSV = %d\n",nSV);
+
+	delete [] QD;
+	delete [] alphaindex;
+	delete [] alpha;
+	delete [] alpha_inc;
+	delete [] alpha_orig;
+	delete [] w_orig;
+	delete [] current_w;
+	delete [] allreduce_buffer;
+	delete [] y;
+}
+
+
+static void solve_l2r_l1l2_svc_adn(const problem *prob, double *w, double eps,
+		double Cp, double Cn, int solver_type, int max_inner_iter = 1, double *alpha_out = NULL)
+{
+	double accumulated_time = 0;
+	int l = prob->l;
+	int w_size = prob->n;
+	int i, s, iter = 0;
+	double C, d, G;
+	int max_iter = 100000;
+	double *alpha = new double[l];
+	double *alpha_orig = new double[l];
+	double *w_orig = new double[w_size];
+	double *current_w = new double[w_size];
+	double *allreduce_buffer = new double[w_size + 2];
+	double old_primal, primal, obj;
+	double loss, reg = 0;
+	schar *y = new schar[l];
+	double init_primal = 0;
+	static double (*loss_term) (const double) = &l2_loss;
+	int nr_node = mpi_get_size();
+	int rank = mpi_get_rank();
+	int shift = int(ceil(double(w_size) / double(nr_node)));
+	int start = shift * rank;
+	int length = min(max(w_size - start, 0), shift);
+	double innerproduct_buffer[2];
+	if (length == 0)
+		start = 0;
+
+	// PG: projected gradient
+	double PG;
+	double scaler = (double)nr_node;
+
+	// default solver_type: L2R_L2LOSS_SVC_DUAL
+	double diag[3] = {0.5/Cn, 0, 0.5/Cp};
+	double upper_bound[3] = {INF, 0, INF};
+	double Cs[3] = {Cn, 0, Cp};
+
+	for(i=0; i<l; i++)
+	{
+		if(prob->y[i] > 0)
+		{
+			y[i] = +1;
+			init_primal += Cp;
+		}
+		else
+		{
+			y[i] = -1;
+			init_primal += Cn;
+		}
+	}
+	mpi_allreduce(&init_primal, 1, MPI_DOUBLE, MPI_SUM);
+	for(i=0; i<l; i++)
+		alpha[i] = 0;
+
+	for(i=0; i<w_size; i++)
+		w[i] = 0;
+
+	int64_t timer_st = wall_clock_ns(), timer_ed;
+
+	QD = new double[l];
+	alphaindex = new int[l];
+	for(i=0; i<l; i++)
+	{
+		feature_node * const xi = prob->x[i];
+		QD[i] = sparse_operator::nrm2_sq(xi);
+
+		alphaindex[i] = i;
+	}
+
+	if (alpha_out == NULL)
+	{
+		old_primal = 0;
+		obj = 0;
+		for (i=start;i<start+length;i++)
+			reg += w[i] * w[i];
+		mpi_allreduce(&reg, 1, MPI_DOUBLE, MPI_SUM);
+		reg *= 0.5;
+		for (i=0;i<l;i++)
+		{
+			obj += alpha[i] * (alpha[i] * diag[GETI(i)] - 2);
+			feature_node const *xi = prob->x[i];
+			loss = 1 - y[i] * sparse_operator::dot(w, xi);
+
+			if (loss > 0)
+				old_primal += loss_term(loss) * Cs[GETI(i)];
+		}
+		mpi_allreduce(&old_primal, 1, MPI_DOUBLE, MPI_SUM);
+		mpi_allreduce(&obj, 1, MPI_DOUBLE, MPI_SUM);
+		old_primal += reg;
+		obj = obj / 2 + reg;
+		memcpy(current_w, w, sizeof(double) * w_size);
+	}
+	while (iter < max_iter)
+	{
+		int update = 0;
+		memcpy(w_orig, w, sizeof(double) * w_size);
+		memcpy(alpha_orig, alpha, sizeof(double) * l);
+		double w_inc_square = 0;
+		double w_dot_w_inc = 0;
+
+		for (int inner_iter = 0;inner_iter < max_inner_iter; inner_iter++)
+		{
+			for (i=0; i<l; i++)
+			{
+				int j = i+rand()%(l-i);
+				swap(alphaindex[i], alphaindex[j]);
+			}
+
+			for (s=0; s<l; s++)
+			{
+				i = alphaindex[s];
+				const schar yi = y[i];
+				feature_node const *xi = prob->x[i];
+
+				G = yi*sparse_operator::dot(w, xi)-1;
+
+				C = upper_bound[GETI(i)];
+				G += alpha[i]*diag[GETI(i)];
+
+				PG = 0;
+				if (alpha[i] == 0)
+				{
+					if (G < 0)
+						PG = G;
+				}
+				else if (alpha[i] == C)
+				{
+					if (G > 0)
+						PG = G;
+				}
+				else
+					PG = G;
+
+				if(fabs(PG) > 1.0e-12)
+				{
+					double alpha_old = alpha[i];
+					alpha[i] = min(max(alpha[i] - G/(scaler * QD[i] + diag[GETI(i)]), 0.0), C);
+					d = yi*(alpha[i] - alpha_old) * scaler;
+					sparse_operator::axpy(d, xi, w);
+				}
+			}
+		}
+
+		for (i=0;i<w_size;i++)
+			allreduce_buffer[i] = (w[i] - w_orig[i]) / scaler;//Delta w
+
+		allreduce_buffer[w_size] = 0;
+		for (i=0;i<l;i++)
+			allreduce_buffer[w_size] += alpha[i] * alpha[i] * diag[GETI(i)] * 0.5 - alpha[i];//for function value evaluation
+		allreduce_buffer[w_size + 1] = 0;
+		for (i=0;i<w_size;i++)
+			allreduce_buffer[w_size+1] += allreduce_buffer[i] * allreduce_buffer[i];
+		mpi_allreduce(allreduce_buffer, w_size + 2, MPI_DOUBLE, MPI_SUM);
+		allreduce_buffer[w_size+1] *= scaler;
+		communication += 1 + 2.0 / (double) w_size;
+		
+		for (i=start;i<start + length;i++)
+		{
+			w_inc_square += allreduce_buffer[i] * allreduce_buffer[i];
+			w_dot_w_inc += allreduce_buffer[i] * w_orig[i];
+		}
+		innerproduct_buffer[0] = w_inc_square;
+		innerproduct_buffer[1] = w_dot_w_inc;
+		mpi_allreduce(innerproduct_buffer, 2, MPI_DOUBLE, MPI_SUM);
+		communication += 2.0 / (double) w_size;
+		double newreg = reg + innerproduct_buffer[0] * 0.5 + innerproduct_buffer[1];
+		double newobj = allreduce_buffer[w_size] + newreg;
+		double denominator = allreduce_buffer[w_size+1];
+		double numerator = innerproduct_buffer[0];
+
+		scaler *= numerator / denominator;
+		if (newobj <= obj)
+		{
+			obj = newobj;
+			reg = newreg;
+			for (i=0;i<w_size;i++)
+				w[i] = w_orig[i] + allreduce_buffer[i];
+			iter++;
+			update = 1;
+		}
+		else
+		{
+			memcpy(alpha, alpha_orig, sizeof(double) * l);
+			memcpy(w, w_orig, sizeof(double) * w_size);
+		}
+		timer_ed = wall_clock_ns();
+		accumulated_time += wall_time_diff(timer_ed, timer_st);
+
+		if (update)
+		{
+			primal = 0;
+			for (i=0;i<l;i++)
+			{
+				feature_node const *xi = prob->x[i];
+				loss = 1 - y[i] * sparse_operator::dot(w, xi);
+
+				if (loss > 0)
+					primal += Cs[GETI(i)] * loss_term(loss);
+			}
+			mpi_allreduce(&primal, 1, MPI_DOUBLE, MPI_SUM);
+
+			primal += reg;
+
+			if (primal < old_primal)
+			{
+				old_primal = primal;
+				memcpy(current_w, w, sizeof(double) * w_size);
+			}
+
+			double gap = (old_primal+obj) / init_primal;
+			info("iter %06d primal %15.20e dual %15.20e scaler %5.3e duality gap %5.3e time %5.3e communication %5.3e\n", iter, primal, obj, scaler, gap, accumulated_time, communication);
+			if (gap < eps)
+			{
+				memcpy(w, current_w, sizeof(double) * w_size);
+				break;
+			}
+		}
+		timer_st = wall_clock_ns();
+	}
+
+	info("\noptimization finished, #iter = %d\n",iter);
+	if (iter >= max_iter)
+		info("\nWARNING: reaching max number of iterations\n\n");
+
+	// calculate objective value
+
+	int nSV = 0;
+	for(i=0; i<l; i++)
+		if(alpha[i] > 0)
+			++nSV;
+	mpi_allreduce(&nSV, 1, MPI_INT, MPI_SUM);
+	info("nSV = %d\n",nSV);
+
+	delete [] QD;
+	delete [] alphaindex;
+	delete [] alpha;
+	delete [] alpha_orig;
+	delete [] w_orig;
+	delete [] current_w;
+	delete [] allreduce_buffer;
+	delete [] y;
+}
+#undef GETI
+
+class l2r_dual_fun
+{
+public:
+	l2r_dual_fun(const problem *prob, double C, double *w);
+	virtual ~l2r_dual_fun();
+	double fun(double *alpha);
+	double fun_primal();
+	double getC();
+	void block_diagonal_H(double *alpha, double *g);
+	void loss_grad(double *alpha, double *g);
+	int get_nr_variable();
+	int get_nr_dual_variables();
+
+	virtual void dual_grad(double *alpha, double *g, double *step = NULL) = 0;
+	virtual void line_search(double *step, double *alpha, double *loss_g, double *step_size, double eta, int *num_line_search_steps) = 0;
+	virtual double get_quadratic_coeff() = 0;
+	virtual double prox(double u) = 0;
+	virtual double loss_dual(double *alpha) = 0;
+protected:
+	int l;
+	int n;
+	int start;
+	int length;
+	int end;
+
+	double *w;
+	double *Xw;
+	double *z;
+	double C;
+	const problem *prob;
+
+	virtual double loss_fun(double *wx) = 0;
+	virtual void XYTv(double *s, double *XYTs) = 0;
+	virtual void XYv(double *s, double *XYs) = 0;
+};
+
+l2r_dual_fun::l2r_dual_fun(const problem *prob, double C, double *w)
+{
+	this->l = prob->l;
+	this->n = prob->n;
+	this->prob = prob;
+	this->C = C;
+	this->w = w;
+	this->Xw = new double[l];
+	this->z = new double[n];
+	int w_size = n;
+	int nr_node = mpi_get_size();
+	int rank = mpi_get_rank();
+	int shift = int(ceil(double(w_size) / double(nr_node)));
+	this->start = shift * rank;
+	this->length = min(max(w_size - start, 0), shift);
+	if (length == 0)
+	{
+		start = 0;
+		end = 0;
+	}
+	else
+		end = start + length;
+}
+
+l2r_dual_fun::~l2r_dual_fun()
+{
+	delete[] Xw;
+	delete[] z;
+}
+
+double l2r_dual_fun::getC()
+{
+	return C;
+}
+
+double l2r_dual_fun::fun(double *alpha)
+{
+	int inc = 1;
+	memset(w, 0, sizeof(double) * n);
+	XYTv(alpha, w);
+	mpi_allreduce(w, n, MPI_DOUBLE, MPI_SUM);
+	double f = ddot_(&length, w + start, &inc, w + start, &inc) / 2.0 + loss_dual(alpha);
+	mpi_allreduce(&f, 1, MPI_DOUBLE, MPI_SUM);
+	return f;
+}
+
+double l2r_dual_fun::fun_primal()
+{
+	int inc = 1;
+	XYv(w, Xw);
+	double f = loss_fun(Xw) * C + ddot_(&length, w + start, &inc, w + start, &inc) * 0.5;
+	mpi_allreduce(&f, 1, MPI_DOUBLE, MPI_SUM);
+	return f;
+}
+
+void l2r_dual_fun::loss_grad(double *alpha, double *g)
+{
+	XYv(w, Xw);
+	for (int i=0;i<l;i++)
+		g[i] = Xw[i];
+}
+
+int l2r_dual_fun::get_nr_variable()
+{
+	return prob->n;
+}
+
+int l2r_dual_fun::get_nr_dual_variables()
+{
+	return prob->l;
+}
+
+class l2r_l2_dual_svm_fun: public l2r_dual_fun
+{
+public:
+	l2r_l2_dual_svm_fun(const problem *prob, double C, double *w);
+	~l2r_l2_dual_svm_fun();
+	void line_search(double *step, double *alpha, double *loss_g, double *step_size, double eta, int *num_line_search_steps);
+	double get_quadratic_coeff();
+	void dual_grad(double *alpha, double *g, double *step = NULL);
+	double prox(double u);
+	double loss_dual(double *alpha);
+protected:
+	double loss_fun(double *wx);
+
+	void XYv(double *s, double *XYs);
+	void XYTv(double *s, double *XYTs);
+
+	double scalar;
+	double *e;
+};
+
+l2r_l2_dual_svm_fun::l2r_l2_dual_svm_fun(const problem *prob, double C, double *w):
+l2r_dual_fun(prob, C, w)
+{
+	scalar = 1.0 / 2.0 / C;
+	e = new double[l];
+	for (int i=0;i<l;i++)
+		e[i] = -1;
+}
+
+l2r_l2_dual_svm_fun::~l2r_l2_dual_svm_fun()
+{
+	delete[] e;
+}
+
+double l2r_l2_dual_svm_fun::get_quadratic_coeff()
+{
+	return scalar;
+}
+
+void l2r_l2_dual_svm_fun::line_search(double *step, double *alpha, double *loss_g, double *step_size, double eta, int *num_line_search_steps)
+{
+	//exact line search: because the objective is quadratic
+	// eta and delta are not used at all
+	double allreducebuffer[2];
+	double tmp_stepsize = 1;
+	int inc = 1;
+	XYTv(step, z);
+
+	mpi_allreduce(z, n, MPI_DOUBLE, MPI_SUM);
+	
+	allreducebuffer[0] = ddot_(&l, step, &inc, loss_g, &inc) + ddot_(&l, step, &inc, alpha, &inc) * scalar + ddot_(&l, step, &inc, e, &inc);
+	allreducebuffer[1] = ddot_(&length, z + start, &inc, z + start, &inc) + ddot_(&l, step, &inc, step, &inc) * scalar;
+	mpi_allreduce(allreducebuffer, 2, MPI_DOUBLE, MPI_SUM);
+	tmp_stepsize = -allreducebuffer[0] / allreducebuffer[1];
+	if (tmp_stepsize <= 0 || allreducebuffer[1] == 0)
+	{
+		info("LINE SEARCH FAILED\n");
+		*step_size = 0;
+		return;
+	}
+	double max_size = tmp_stepsize;
+	for (int i=0;i<l;i++)
+		if (step[i] < 0)
+			max_size = min(max_size, -alpha[i] / step[i]);
+	mpi_allreduce(&max_size, 1, MPI_DOUBLE, MPI_MIN);
+	*step_size = max_size;
+	daxpy_(&n, &max_size, z, &inc, w, &inc);
+}
+
+inline double l2r_l2_dual_svm_fun::loss_fun(double *wx)
+{
+	int i;
+	double loss = 0;
+
+	for (i=0;i<l;i++)
+	{
+		double tmp = 1 - wx[i];
+		loss += (tmp > 0) * tmp * tmp;
+	}
+	return loss;
+}
+
+inline double l2r_l2_dual_svm_fun::loss_dual(double *alpha)
+{
+	int inc = 1;
+	return ddot_(&l, alpha, &inc, alpha, &inc) / 4.0 / C + ddot_(&l, alpha, &inc, e, &inc);
+}
+
+inline void l2r_l2_dual_svm_fun::dual_grad(double *alpha, double *g, double *step)
+{
+	int inc = 1;
+	double one = 1.0;
+	daxpy_(&l, &one, e, &inc, g, &inc);
+	daxpy_(&l, &scalar, alpha, &inc, g, &inc);
+	if (step != NULL)
+		daxpy_(&l, &scalar, step, &inc, g, &inc);
+}
+
+void l2r_l2_dual_svm_fun::XYv(double *s, double *XYs)
+{
+	for(int i=0;i<l;i++)
+		XYs[i] = prob->y[i] * sparse_operator::dot(s, prob->x[i]);
+}
+
+void l2r_l2_dual_svm_fun::XYTv(double *s, double *XYTs)
+{
+	memset(XYTs, 0, sizeof(double) * n);
+	for(int i=0;i<l;i++)
+	{
+		double a = s[i] * prob->y[i];
+		if (a != 0)
+			sparse_operator::axpy(a, prob->x[i], XYTs);
+	}
+}
+
+inline double l2r_l2_dual_svm_fun::prox(double u)
+{
+	return max(u, 0.0);
+}
+	
 class l1r_lr_fun
 {
 public:
@@ -151,22 +1319,16 @@ public:
 	double fun(double *w);
 	void loss_grad(double *w, double *g);
 	void cal_pg(double *w, double *loss_g, double *pg);
-	int init_step(double *w, double *loss_g, double *step, int *index);
 	int setselection(double *w, double *loss_g, int *index);
 	int get_nr_variable(void);
-	int get_nr_data(void);
-	void cal_sqrtCD(double *sqrtCD);
 	double line_search(double *step, double *old_w, double *loss_g, double *pg, double *step_size, double eta,  double old_f, int *num_line_search_steps, double *w);
 	double armijo_line_search(double *step, double *w, double *loss_g, double *step_size, double eta, int *num_line_search_steps, double *delta_ret, int *index = NULL, int indexlength = 0, int localstart = 0, int locallength = 0);
-	//	void get_Xw(double *Xw_);
-	double *get_Xw();
-	virtual void Xv(double *v, double *Xv) = 0;
-	virtual void subXv(double *v, int *index, int length, double *Xv) = 0;
-	void Hv(double *s, double *Hs);
 	double vHv(double *v);
 	
 protected:
 	virtual void XTv(double *v, double *XTv) = 0;
+	virtual void Xv(double *v, double *Xv) = 0;
+	virtual void subXv(double *v, int *index, int length, double *Xv) = 0;
 
 	double global_l;
 	double C;
@@ -241,10 +1403,6 @@ double l1r_lr_fun::fun(double *w)
 	return(f);
 }
 
-double *l1r_lr_fun::get_Xw()
-{
-	return Xw;
-}
 
 void l1r_lr_fun::loss_grad(double *w, double *g)
 {
@@ -263,7 +1421,6 @@ void l1r_lr_fun::loss_grad(double *w, double *g)
 	mpi_allreduce(g, n, MPI_DOUBLE, MPI_SUM);
 	communication += 1.0;
 }
-
 
 void l1r_lr_fun::cal_pg(double *w, double *loss_g, double *pg)
 {
@@ -286,26 +1443,6 @@ void l1r_lr_fun::cal_pg(double *w, double *loss_g, double *pg)
 		}
 }
 
-int l1r_lr_fun::init_step(double *w, double *loss_g, double *step, int *index)
-{
-	int i;
-	int indexlength = 0;
-
-	for (i=0; i<length; i++)
-	{
-		double Gp = loss_g[i] + 1;
-		double Gn = loss_g[i] - 1;
-		step[i] = -(Gp < 0) * Gp - (Gn > 0) * Gn;
-		if (step[i] != 0)
-		{
-			step[indexlength] = step[i] / global_l;
-			index[indexlength] = i;
-			indexlength++;
-		}
-	}
-	return indexlength;
-}
-
 int l1r_lr_fun::setselection(double *w, double *loss_g, int *index)
 {
 	int i;
@@ -325,18 +1462,6 @@ int l1r_lr_fun::get_nr_variable(void)
 	return prob->n;
 }
 
-
-int l1r_lr_fun::get_nr_data(void)
-{
-	return prob->l;
-}
-
-void l1r_lr_fun::cal_sqrtCD(double *sqrtCD)
-{
-	int l=prob->l;
-	for (int i=0;i<l;i++)
-		sqrtCD[i] = sqrt(C*D[i]);
-}
 
 double l1r_lr_fun::line_search(double *step, double *old_w, double *loss_g, double *pg, double *step_size, double eta,  double old_f, int *num_line_search_steps, double *w)
 {
@@ -486,22 +1611,6 @@ double l1r_lr_fun::armijo_line_search(double *step, double *w, double *loss_g, d
 	}
 
 	return current_f;
-}
-
-void l1r_lr_fun::Hv(double *s, double *Hs)
-{
-	int i;
-	int l=prob->l;
-	int w_size=get_nr_variable();
-	double *wa = new double[l];
-
-	Xv(s, wa);
-	for(i=0;i<l;i++)
-		wa[i] = C*D[i]*wa[i];
-
-	XTv(wa, Hs);
-	mpi_allreduce(Hs, w_size, MPI_DOUBLE, MPI_SUM);
-	delete[] wa;
 }
 
 double l1r_lr_fun::vHv(double *s)
@@ -727,6 +1836,7 @@ protected:
 	void (*owlqn_print_string)(const char *buf);
 	int start;
 	int length;
+	int sylength;
 	int *recv_count;
 	int *displace;
 private:
@@ -741,13 +1851,14 @@ public:
 	~PLBFGS();
 
 	void plbfgs(double *w);
-private:
-	void prox_grad(double *w, double *g, double *local_step, double *oldd, double alpha = 0, int indexlength = -1);
+protected:
 	double inner_eps;
 	int max_inner;
 	void update_inner_products(double **inner_product_matrix, int k, int DynamicM, double *s, double *y);
 	void compute_R(double *R, int DynamicM, double **inner_product_matrix, int k, double gamma);
 	void SpaRSA(double *w, double *loss_g, double *R, double *s, double *y, double gamma, double *local_step, int DynamicM, int *index, int indexlength);
+private:
+	void prox_grad(double *w, double *g, double *local_step, double *oldd, double alpha = 0, int indexlength = -1);
 };
 
 class SPARSA: public OWLQN
@@ -759,6 +1870,23 @@ public:
 	void sparsa(double *w);
 private:
 	void prox_grad(double *w, double *g, double *local_step, double alpha, int vectorsize);
+};
+
+class PLBFGS_DUAL: public PLBFGS
+{
+public:
+	PLBFGS_DUAL(const l2r_dual_fun *fun_obj, double eps = 0.1, int m=10, double inner_eps = 0.01, int max_inner = 100, double eta = 1e-4, const problem *prob = NULL, double *w = NULL, int max_iter = 5000);
+	~PLBFGS_DUAL();
+
+	void plbfgs(int minswitch = 10);
+
+protected:
+	l2r_dual_fun *dualfun_obj;
+private:
+	void SpaRSA(double *alpha, double *loss_g, double *R, double *s, double *y, double gamma, double *step, int DynamicM, int l);
+	void prox_grad(double *alpha, double *g, double *step, double *oldd, double psi, int l);
+	const problem *prob;
+	double *w;
 };
 
 static void default_print(const char *buf)
@@ -792,7 +1920,9 @@ OWLQN::OWLQN(const l1r_lr_fun *fun_obj, double eps, int m, double eta, int max_i
 	this->eta = eta;
 	owlqn_print_string = default_print;
 	this->M = m;
-	int w_size = this->fun_obj->get_nr_variable();
+	int w_size = 0;
+	if (fun_obj != NULL)
+		w_size = this->fun_obj->get_nr_variable();
 	int nr_node = mpi_get_size();
 	int rank = mpi_get_rank();
 	int shift = int(ceil(double(w_size) / double(nr_node)));
@@ -800,6 +1930,7 @@ OWLQN::OWLQN(const l1r_lr_fun *fun_obj, double eps, int m, double eta, int max_i
 	this->displace = new int[nr_node];
 	this->start = shift * rank;
 	this->length = min(max(w_size - start, 0), shift);
+	this->sylength = min(max(w_size - start, 0), shift);
 	if (length == 0)
 		start = 0;
 	int counter = 0;
@@ -1235,7 +2366,6 @@ void PLBFGS::plbfgs(double *w)
 			alpha = fun_obj->vHv(loss_g);
 			info("init alpha = %g\n",alpha);
 			prox_grad(w + start, loss_g + start, local_step, local_step, alpha);
-//			indexlength = fun_obj->init_step(w + start, loss_g + start, local_step, index);
 			daxpy_(&length, &mone, w + start, &inc, local_step, &inc);
 		}
 
@@ -1328,8 +2458,8 @@ void PLBFGS::update_inner_products(double **inner_product_matrix, int k, int Dyn
 	double one = 1.0;
 
 	double *buffer = new double[DynamicM * 2];
-	dgemv_(T, &length, &DynamicM, &one, s, &length, s + k * length, &inc, &zero, buffer, &inc);
-	dgemv_(T, &length, &DynamicM, &one, y, &length, s + k * length, &inc, &zero, buffer + DynamicM, &inc);
+	dgemv_(T, &sylength, &DynamicM, &one, s, &sylength, s + k * sylength, &inc, &zero, buffer, &inc);
+	dgemv_(T, &sylength, &DynamicM, &one, y, &sylength, s + k * sylength, &inc, &zero, buffer + DynamicM, &inc);
 
 	mpi_allreduce(buffer, 2 * DynamicM, MPI_DOUBLE, MPI_SUM);
 	communication += 2 * DynamicM / global_n;
@@ -1371,8 +2501,6 @@ void PLBFGS::compute_R(double *R, int DynamicM, double **inner_product_matrix, i
 			R[idx * size + DynamicM + idxj] = inner_product_matrix[idx][2 * idxj + 1];
 		}
 	}
-
-	//compute_inverse(R, size);
 	inverse(R, size);
 }
 
@@ -1383,7 +2511,6 @@ void PLBFGS::SpaRSA(double *w, double *loss_g, double *R, double *s, double *y, 
 	const double ALPHA_MIN = 1e-4;
 	//Fixed parameters (except max_iter) from Taedong's code
 
-	info("inner_eps = %g\n",inner_eps);
 	int i,j;
 	double one = 1.0;
 	int inc = 1;
@@ -1504,7 +2631,7 @@ void PLBFGS::SpaRSA(double *w, double *loss_g, double *R, double *s, double *y, 
 			if (iter != 0)
 			{
 				//compute the gradient of the sub-problem: g + gamma * d - Q R Q^T d
-				//Note that RQ^Td is already obtained from the previous round in computing obj value
+				//Note that RQ^Td is already obtained from the previous round in computing the obj value
 				daxpy_(&indexlength, &gamma, local_step, &inc, g, &inc);
 				dgemv_(N, &indexlength, &DynamicM, &mgamma, subs, &indexlength, tmp, &inc, &one, g, &inc);
 				dgemv_(N, &indexlength, &DynamicM, &mone, suby, &indexlength, tmp + DynamicM, &inc, &one, g, &inc);
@@ -1587,8 +2714,6 @@ void PLBFGS::SpaRSA(double *w, double *loss_g, double *R, double *s, double *y, 
 			iter++;
 		}
 	}
-	info("iters = %d, prox_grad = %d\n",iter, proxgradcounts);
-
 	if (iter == 1)
 		inner_eps /= 4.0;
 	delete[] oldd;
@@ -1621,6 +2746,345 @@ void PLBFGS::prox_grad(double *w, double *g, double *local_step, double *oldd, d
 		local_step[i] = max(fabs(u) - 1.0 / alpha, 0.0);
 		local_step[i] *= ((u > 0) - (u<0));
 	}
+}
+
+PLBFGS_DUAL::PLBFGS_DUAL(const l2r_dual_fun *fun_obj, double eps, int m, double inner_eps, int max_inner, double eta, const problem *prob, double *w, int max_iter):
+	PLBFGS(NULL, eps, m, inner_eps, max_inner, eta, max_iter)
+{
+	this->dualfun_obj=const_cast<l2r_dual_fun *>(fun_obj);
+	sylength = dualfun_obj->get_nr_dual_variables();
+	this->prob = prob;
+	this->w = w;
+}
+
+PLBFGS_DUAL::~PLBFGS_DUAL()
+{
+}
+
+void PLBFGS_DUAL::plbfgs(int minswitch)
+{
+	const double update_eps = 1e-10;//Ensure PD of the LBFGS matrix
+
+	int n = dualfun_obj->get_nr_variable();
+	int l = dualfun_obj->get_nr_dual_variables();
+	int inc = 1;
+	double one = 1.0;
+	double mone = -1.0;
+	minswitch = max(min(M-1, minswitch),0);
+
+	int i, k = 0;
+	int iter = 0;
+	int skip = 0;
+	int DynamicM = 0;
+	double f, primal;
+	double delta0;
+	double delta;
+	double step_size = 1;
+	double gamma = 0;
+	int skip_flag;
+	int num_linesearch = 0;
+	int64_t timer_st, timer_ed;
+	double accumulated_time = 0;
+	double all_reduce_buffer[3];
+
+	double *s = new double[M*l];
+	double *y = new double[M*l];
+	double *tmpy = new double[l];
+	double *tmps = new double[l];
+	double *loss_g = new double[l];
+	double *step = new double[l];
+	double bestprimal = 0.0;
+	double *R = new double[4 * M * M];
+	double **inner_product_matrix = new double*[M];
+	for (i=0; i < M; i++)
+		inner_product_matrix[i] = new double[2*M];
+	double *alpha = new double[l];
+
+	// calculate delta in line search with proximal gradient at w=0 for stopping condition.
+	memset(alpha, 0, sizeof(double) * l);
+	bestprimal = dualfun_obj->fun_primal();
+	delta0 = dualfun_obj->fun(alpha) + bestprimal;
+	delta = delta0;
+	communication = 0;
+	global_n = (double)n;
+
+	timer_st = wall_clock_ns();
+	f = dualfun_obj->fun(alpha);
+	while (iter < max_iter)
+	{
+		skip_flag = 0;
+		timer_ed = wall_clock_ns();
+		accumulated_time += wall_time_diff(timer_ed, timer_st);
+		f = dualfun_obj->fun(alpha);
+		primal = dualfun_obj->fun_primal();
+		bestprimal = min(primal,bestprimal);
+		delta = f + bestprimal;
+
+		info("iter=%03d m=%02d f=%15.20e stepsize=%5.3e dualitygap=%5.3e primal=%15.20e elapsed_time=%5.3e communication=%5.3e\n", iter, DynamicM,  f, step_size, delta, primal, accumulated_time,communication);
+		if (step_size == 0 || (iter > 0 && delta / delta0 < eps))
+			break;
+
+		timer_st = wall_clock_ns(),
+		dualfun_obj->loss_grad(alpha, loss_g);
+
+		double s0y0 = 0;
+		double s0s0 = 0;
+		double y0y0 = 0;
+		
+		//Decide if we want to add the new pair of s,y and then update the inner products if added
+		if (iter != 0)
+		{
+			daxpy_(&l, &one, loss_g, &inc, tmpy, &inc);
+			
+			all_reduce_buffer[0] = ddot_(&l, tmpy, &inc, tmps, &inc);
+			all_reduce_buffer[1] = ddot_(&l, tmps, &inc, tmps, &inc);
+			all_reduce_buffer[2] = ddot_(&l, tmpy, &inc, tmpy, &inc);
+			mpi_allreduce(all_reduce_buffer, 3, MPI_DOUBLE, MPI_SUM);
+			communication += 3.0 / n;
+			s0y0 = all_reduce_buffer[0];
+			s0s0 = all_reduce_buffer[1];
+			y0y0 = all_reduce_buffer[2];
+			if (s0y0 >= update_eps * s0s0)
+			{
+				memcpy(y + (k*l), tmpy, l * sizeof(double));
+				memcpy(s + (k*l), tmps, l * sizeof(double));
+				gamma = y0y0 / s0y0;
+			}
+			else
+			{
+				info("skip\n");
+				skip_flag = 1;
+				skip++;
+			}
+			DynamicM = min(iter - skip, M);
+		}
+
+		memset(tmps, 0, sizeof(double) * l);
+
+		if (DynamicM > 0)
+		{
+			if (skip_flag == 0)
+			{
+				update_inner_products(inner_product_matrix, k, DynamicM, s, y);
+				compute_R(R, DynamicM, inner_product_matrix, k, gamma);
+				k = (k+1)%M;
+			}
+		}
+		if (DynamicM > minswitch)
+		{
+			memset(step, 0, sizeof(double) * l);
+			SpaRSA(alpha, loss_g, R, s, y, gamma, step, DynamicM, l);
+			communication += 1.0;
+			dualfun_obj->line_search(step, alpha, loss_g, &step_size, eta, &num_linesearch);
+			if (step_size == 0.0)
+			{
+				info("WARNING: stepsize = 0\n");
+				break;
+			}
+			for (i=0;i<l;i++)
+			{
+				alpha[i] += step[i] * step_size;
+				tmps[i] = step[i] * step_size;
+			}
+		}
+		else
+		{
+			double C = dualfun_obj->getC();
+//			memcpy(g, loss_g, sizeof(double) * l);
+//			dualfun_obj->dual_grad(alpha, g);
+//			prox_grad(alpha, g, step, step, 0, l);
+			memcpy(tmps, alpha, sizeof(double) * l);
+			dscal_(&l, &mone, tmps, &inc);
+			solve_l2r_l1l2_svc(this->prob, this->w, 1e-20, C, C, L2R_L2_BDA, 1, alpha);
+			daxpy_(&l, &one, alpha, &inc, tmps, &inc);
+		}
+
+		memcpy(tmpy, loss_g, sizeof(double) * l);
+		dscal_(&l, &mone, tmpy, &inc);
+		iter++;
+	}
+
+	delete[] s;
+	delete[] y;
+	delete[] tmpy;
+	delete[] tmps;
+	delete[] loss_g;
+	delete[] step;
+	for (i=0; i < M; i++)
+		delete[] inner_product_matrix[i];
+	delete[] inner_product_matrix;
+	delete[] R;
+}
+
+void PLBFGS_DUAL::prox_grad(double *alpha, double *g, double *step, double *oldd, double psi, int l)
+{
+	int inc = 1;
+	double one = 1.0;
+	if (psi<= 0)//Let the step be g / ||g||
+	{
+		psi = ddot_(&l, g, &inc, g, &inc);
+		mpi_allreduce(&psi, 1, MPI_DOUBLE, MPI_SUM);
+		communication += 1.0 / global_n;
+		psi = sqrt(psi);
+	}
+
+	memcpy(step, alpha, sizeof(double) * l);
+	daxpy_(&l, &one, oldd, &inc, step, &inc);
+	psi = -1.0/psi;
+	daxpy_(&l, &psi, g, &inc, step, &inc);
+
+	for (int i=0;i<l;i++)
+		step[i] = dualfun_obj->prox(step[i]);
+}
+
+void PLBFGS_DUAL::SpaRSA(double *alpha, double *loss_g, double *R, double *s, double *y, double gamma, double *step, int DynamicM, int l)
+{
+	const double eta = .01 / 2;
+	const double PSI_MAX = 1e30;
+	const double PSI_MIN = 1e-4;
+	//Fixed parameters (except max_iter) from Taedong's code
+
+	int i;
+	double one = 1.0;
+	int inc = 1;
+	double mgamma = -gamma;
+	double mone = -one;
+	double zero = 0;
+	double dnorm0;
+	double dnorm;
+	double old_reg = dualfun_obj->loss_dual(alpha);
+	double new_reg = 0;
+	char N[] = "N";
+	char T[] = "T";
+
+
+	//parameters for blas
+
+	int iter = 0;
+	int Rsize = 2 * DynamicM;
+
+	double *oldd = new double[l];
+	double *oldg = new double[l];
+	double *g = new double[l];
+	double *ddiff = new double[l];//Note that ddiff is always oldd - newd
+	double *SYTd = new double[Rsize + 3];
+	double *tmp = new double[Rsize];
+
+	double oldquadratic = 0;
+	double psi = 0;
+	double all_reduce_buffer;
+	int proxgradcounts = 0;
+	
+	memset(oldd, 0, sizeof(double) * l);
+	memcpy(oldg, loss_g, sizeof(double) * l);
+	dualfun_obj->dual_grad(alpha, oldg);
+	memset(step, 0, sizeof(double) * l);
+	memset(SYTd, 0, (Rsize + 3) * sizeof(double));
+
+	while (iter < max_inner)
+	{
+		if (iter != 0)
+		{
+			//compute the gradient of the sub-problem: g + gamma * d - Q R Q^T d
+			//Note that RQ^Td is already obtained from the previous round in computing the obj value
+			memcpy(g, loss_g, sizeof(double) * l);
+			dualfun_obj->dual_grad(alpha, g, step);
+			daxpy_(&l, &gamma, step, &inc, g, &inc);
+			dgemv_(N, &l, &DynamicM, &mgamma, s, &l, tmp, &inc, &one, g, &inc);
+			dgemv_(N, &l, &DynamicM, &mone, y, &l, tmp + DynamicM, &inc, &one, g, &inc);
+
+			//Now grad is ready, compute psi = y^T s / s^T s, of the subprob
+			daxpy_(&l, &mone, g, &inc, oldg, &inc);//get -y of the subprob
+
+			all_reduce_buffer = ddot_(&l, ddiff, &inc, oldg, &inc);
+			mpi_allreduce(&all_reduce_buffer, 1, MPI_DOUBLE, MPI_SUM);
+			communication += 1.0 / global_n;
+			psi = all_reduce_buffer / SYTd[Rsize + 2];
+
+			memcpy(oldg, g, sizeof(double) * l);
+		}
+		else
+		{
+			memcpy(g, oldg, sizeof(double) * l);
+			psi = gamma + dualfun_obj->get_quadratic_coeff();
+		}
+
+
+		psi = max(PSI_MIN, psi);
+		double fun_improve = 0.0;
+		double rhs = -1;
+		double tmpquadratic = 0;
+		int times = 0;
+		memset(SYTd, 0, (Rsize + 3) * sizeof(double));
+
+		//Line search stopping: f^+ - f < -eta * psi * |x^+ - x|^2
+		while (fun_improve >= rhs)
+		{
+			times++;
+			if (psi > PSI_MAX || rhs == 0)
+				break;
+			prox_grad(alpha, g, step, oldd, psi, l);
+			new_reg = dualfun_obj->loss_dual(step);
+			proxgradcounts++;
+			daxpy_(&l, &mone, alpha, &inc, step, &inc);
+			memcpy(ddiff, oldd, sizeof(double) * l);
+			daxpy_(&l, &mone, step, &inc, ddiff, &inc);//ddiff = d - d^+
+
+			dgemv_(T, &l, &DynamicM, &gamma, s, &l, step, &inc, &zero, SYTd, &inc);
+			dgemv_(T, &l, &DynamicM, &one, y, &l, step, &inc, &zero, SYTd + DynamicM, &inc);
+
+			//SYTd[Rsize + 2] records ||x^+ - x||^2
+			SYTd[Rsize + 2] = ddot_(&l, ddiff, &inc, ddiff, &inc);
+
+			//SYTd[Rsize + 1] records func diff in the regularizer and g^T d
+			SYTd[Rsize + 1] = -ddot_(&l, loss_g, &inc, ddiff, &inc) + new_reg - old_reg;
+			//SYTd[Rsize] records d^T d
+			SYTd[Rsize] = ddot_(&l, step, &inc, step, &inc);
+
+			mpi_allreduce(SYTd, Rsize + 3, MPI_DOUBLE, MPI_SUM);
+			communication += (Rsize + 3) / global_n;
+
+			for (i=0;i<Rsize;i++)
+				tmp[i] = ddot_(&Rsize, R + i * Rsize, &inc, SYTd, &inc);
+			//dsymv_(U, &Rsize, &one, R, &Rsize, SYTd, &inc, &zero, tmp, &inc) is somehow buggy so replaced it with this
+			tmpquadratic = gamma * SYTd[Rsize] - ddot_(&Rsize, SYTd, &inc, tmp, &inc);
+			fun_improve = SYTd[Rsize + 1] + (tmpquadratic - oldquadratic) / 2;
+			rhs = -eta * psi * SYTd[Rsize + 2];
+
+			psi *= 2.0;
+		}
+
+		dnorm = sqrt(SYTd[Rsize + 2]);
+		if (iter == 0)
+			dnorm0 = dnorm;
+		oldquadratic = tmpquadratic;
+		old_reg = new_reg;
+
+		if (psi > PSI_MAX)
+		{
+			memcpy(step, oldd, sizeof(double) * l);
+			info("MAXPSI\n");
+			break;
+		}
+		if (rhs == 0)
+		{
+			memcpy(step, oldd, sizeof(double) * l);
+			info("rhs = 0\n");
+			break;
+		}
+		memcpy(oldd, step, sizeof(double) * l);
+
+		if (iter > 0 && dnorm / dnorm0 < inner_eps)
+			break;
+		iter++;
+	}
+	info("iters = %d, prox = %d\n", iter, proxgradcounts);
+	delete[] oldd;
+	delete[] oldg;
+	delete[] g;
+	delete[] ddiff;
+	delete[] SYTd;
+	delete[] tmp;
 }
 
 SPARSA::SPARSA(const l1r_lr_fun *fun_obj, double eps, double eta, int max_iter):
@@ -1750,7 +3214,6 @@ void SPARSA::prox_grad(double *w, double *g, double *step, double alpha, int vec
 	}
 }
 
-// end of l1 solvers
 
 static void transpose(const problem *prob, feature_node **x_space_ret, problem *prob_col)
 {
@@ -1891,6 +3354,10 @@ static void group_classes(const problem *prob, int *nr_class_ret, int **label_re
 static void train_one(const problem *prob, const parameter *param, double *w)
 {
 	double eps = param->eps;
+	l1r_lr_fun *l1r_fun_obj=NULL;
+	problem prob_col;
+	feature_node *x_space = NULL;
+	communication = 0;
 
 	int l = prob->l;
 	int pos = 0;
@@ -1904,11 +3371,11 @@ static void train_one(const problem *prob, const parameter *param, double *w)
 
 	double primal_solver_tol = (eps*max(min(pos,neg), 1))/l;
 
-	l1r_lr_fun *l1r_fun_obj=NULL;
-	problem prob_col;
-	feature_node *x_space = NULL;
-	transpose(prob, &x_space ,&prob_col);
-	l1r_fun_obj = new l1r_lr_fun_col(&prob_col, param->C);
+	if (param->solver_type == L1R_LR_OWLQN || param->solver_type ==L1R_LR_BFGS || param->solver_type == L1R_LR_SPARSA)
+	{
+		transpose(prob, &x_space ,&prob_col);
+		l1r_fun_obj = new l1r_lr_fun_col(&prob_col, param->C);
+	}
 
 	switch(param->solver_type)
 	{
@@ -1933,14 +3400,41 @@ static void train_one(const problem *prob, const parameter *param, double *w)
 			sparsa_obj.sparsa(w);
 			break;
 		}
+		case L2R_L2_BFGS:
+		{
+			l2r_l2_dual_svm_fun *l2r_fun_obj = new l2r_l2_dual_svm_fun(prob, param->C, w);
+			PLBFGS_DUAL plbfgs_obj(l2r_fun_obj, param->eps, param->m, param->inner_eps, param->max_inner_iter, param->eta, prob, w);
+			plbfgs_obj.set_print_string(liblinear_print_string);
+			plbfgs_obj.plbfgs(param->minswitch);
+			delete l2r_fun_obj;
+			break;
+		}
+		case L2R_L2_BDA:
+		{
+			solve_l2r_l1l2_svc(prob, w, param->eps, param->C, param->C, param->solver_type, param->max_inner_iter);
+			break;
+		}
+		case L2R_L2_ADN:
+		{
+			solve_l2r_l1l2_svc_adn(prob, w, param->eps, param->C, param->C, param->solver_type, param->max_inner_iter);
+			break;
+		}
+		case L2R_L2_BDA_CATALYST:
+		{
+			solve_l2r_l1l2_svc_catalyst(prob, w, param->eps, param->C, param->C, param->solver_type, param->eta, param->kappa, param->beta, param->max_inner_iter);
+			break;
+		}
 		default:
 			if(mpi_get_rank() == 0)
 				fprintf(stderr, "ERROR: unknown solver_type\n");
 	}
-	delete l1r_fun_obj;
-	delete [] prob_col.y;
-	delete [] prob_col.x;
-	delete [] x_space;
+	if (param->solver_type == L1R_LR_OWLQN || param->solver_type ==L1R_LR_BFGS || param->solver_type == L1R_LR_SPARSA)
+	{
+		delete l1r_fun_obj;
+		delete [] prob_col.y;
+		delete [] prob_col.x;
+		delete [] x_space;
+	}
 }
 
 //
@@ -2338,7 +3832,11 @@ const char *check_parameter(const problem *prob, const parameter *param)
 
 	if(param->solver_type != L1R_LR_OWLQN
 	&& param->solver_type != L1R_LR_BFGS
-	&& param->solver_type != L1R_LR_SPARSA)
+	&& param->solver_type != L1R_LR_SPARSA
+	&& param->solver_type != L2R_L2_BFGS
+	&& param->solver_type != L2R_L2_BDA
+	&& param->solver_type != L2R_L2_ADN
+	&& param->solver_type != L2R_L2_BDA_CATALYST)
 		return "unknown solver type";
 
 	return NULL;

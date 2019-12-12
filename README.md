@@ -1,6 +1,9 @@
 # DPLBFGS - A Distributed Proximal LBFGS Method for Regularized Optimization
 
-This code implements the algorithm used in the experiment of the following paper in C/C++ and MPI:
+This code implements the algorithms used in the experiment of the following papers in C/C++ and MPI:
+_Lee, Ching-pei, Lim, Cong Han, Wright, Stephen J. [A Distributed Quasi-Newton Algorithm for Primal and Dual
+Regularized Empirical Risk Minimization](). Technical Report, 2019._
+
 _Lee, Ching-pei, Lim, Cong Han, Wright, Stephen J. [A Distributed Quasi-Newton Algorithm for Empirical Risk
 	Minimization with Nonsmooth Regularization](http://www.optimization-online.org/DB_HTML/2018/03/6500.html). The 24th ACM SIGKDD
 	International Conference on Knowledge Discovery and Data Mining, 2018._
@@ -8,6 +11,8 @@ _Lee, Ching-pei, Lim, Cong Han, Wright, Stephen J. [A Distributed Quasi-Newton A
 In additional to our algorithm, the following algorithms are also implemented.
 - OWLQN
 - SPARSA
+- BDA (with Catalyst)
+- ADN
 
 ## Getting started
 To compile the code, you will need to install g++ and an implementation of MPI.
@@ -19,8 +24,18 @@ Then the program ./train solves the optimization problem to obtain a model.
 
 ## Problem being solved
 
-The code solves the L1-regularized logistic regression problem.
+Solvers 0-2 solve the L1-regularized logistic regression problem
 
 min_{w} |w|_1 + C \sum_{i=1}^n \log(1 + \exp(- y_i w^T x_i))
 
 with a user-specified parameter C > 0.
+
+Solvers 3-6 solve the dual problem of the L2-regularized squared-hinge loss problem
+The primal problem is:
+
+min_{w}  |w|_2^2/2 + C \sum_{i=1}^n \max(0,1 - y_i w^T x_i),
+
+with a user-specified parameter C > 0,  and the dual problem is:
+
+min_{\alpha \geq 0}  |\sum_{i=1}^l \alpha_i x_i y_i|_2^2 / 2 + \sum_{i=1}^l \alpha_i^2 / (4C) - \sum_{i=1}^l \alpha_i.
+

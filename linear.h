@@ -5,8 +5,6 @@
 extern "C" {
 #endif
 
-extern int liblinear_version;
-
 struct feature_node
 {
 	int index;
@@ -23,7 +21,7 @@ struct problem
 };
 
 /* solver_type */
-enum { L1R_LR_OWLQN, L1R_LR_BFGS, L1R_LR_SPARSA};
+enum { L1R_LR_OWLQN, L1R_LR_BFGS, L1R_LR_SPARSA, L2R_L2_BFGS, L2R_L2_BDA, L2R_L2_ADN, L2R_L2_BDA_CATALYST};
 
 struct parameter
 {
@@ -34,8 +32,11 @@ struct parameter
 	double C;
 	int m;
 	double eta;
+	double kappa;
+	double beta;
 	double inner_eps;
 	int max_inner_iter;
+	int minswitch;
 };
 
 struct model

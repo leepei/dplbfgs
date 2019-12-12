@@ -1,6 +1,8 @@
 CC = mpicc
 CXX = mpicxx
 CFLAGS = -Wall -Wconversion -O3 -fPIC
+SHVER = 3
+OS = $(shell uname)
 LIBS = -lblas -llapack
 
 all: train predict
