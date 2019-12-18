@@ -2,7 +2,7 @@
 
 This code implements the algorithms used in the experiment of the following papers in C/C++ and MPI:
 _Lee, Ching-pei, Lim, Cong Han, Wright, Stephen J. [A Distributed Quasi-Newton Algorithm for Primal and Dual
-Regularized Empirical Risk Minimization](). Technical Report, 2019._
+Regularized Empirical Risk Minimization](http://www.optimization-online.org/DB_HTML/2019/12/7518.html). Technical Report, 2019._
 
 _Lee, Ching-pei, Lim, Cong Han, Wright, Stephen J. [A Distributed Quasi-Newton Algorithm for Empirical Risk
 	Minimization with Nonsmooth Regularization](http://www.optimization-online.org/DB_HTML/2018/03/6500.html). The 24th ACM SIGKDD
